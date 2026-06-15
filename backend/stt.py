@@ -8,6 +8,7 @@ import glob
 import shutil
 import tempfile
 import logging
+from queue import Queue
 from faster_whisper import WhisperModel
 from pydub import AudioSegment
 
@@ -63,18 +64,36 @@ def _configure_ffmpeg():
 
 _configure_ffmpeg()
 
+
+def _detect_device() -> tuple[str, str]:
+    """Return (device, compute_type) based on CUDA availability."""
+    try:
+        import ctranslate2
+        has_cuda = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        has_cuda = False
+    if has_cuda:
+        return "cuda", "float16"
+    return "cpu", "int8"
+
+
 # Load model once at module import
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_POOL_SIZE = int(os.getenv("WHISPER_POOL_SIZE", "2"))
 
-logger.info(f"Loading Whisper model: {WHISPER_MODEL} on {WHISPER_DEVICE}")
-_model = WhisperModel(
-    WHISPER_MODEL,
-    device=WHISPER_DEVICE,
-    compute_type=WHISPER_COMPUTE_TYPE,
+_auto_device, _auto_compute = _detect_device()
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE") or _auto_device
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE") or _auto_compute
+
+logger.info(
+    f"Loading {WHISPER_POOL_SIZE}x Whisper '{WHISPER_MODEL}' on {WHISPER_DEVICE} "
+    f"(compute_type={WHISPER_COMPUTE_TYPE})"
+    + (" [auto-detected]" if not os.getenv("WHISPER_DEVICE") else " [env override]")
 )
-logger.info("Whisper model loaded.")
+_pool: Queue[WhisperModel] = Queue()
+for _ in range(WHISPER_POOL_SIZE):
+    _pool.put(WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE))
+logger.info(f"Whisper pool ready ({WHISPER_POOL_SIZE} instances).")
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
@@ -92,8 +111,9 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         audio.export(tmp.name, format="wav")
         tmp_path = tmp.name
 
+    model = _pool.get()
     try:
-        segments, info = _model.transcribe(
+        segments, info = model.transcribe(
             tmp_path,
             beam_size=1,           # Greedy decoding = faster
             vad_filter=True,        # Skip silence
@@ -104,4 +124,5 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         logger.info(f"Transcribed: {text!r}")
         return text
     finally:
+        _pool.put(model)
         os.unlink(tmp_path)

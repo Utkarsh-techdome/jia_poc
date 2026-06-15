@@ -34,6 +34,7 @@ export function useInterview() {
   const vadRef = useRef(null)
   const playerRef = useRef(null)
   const pendingSentenceTextRef = useRef('')
+  const pendingFullTextRef = useRef('')
   const capturingRef = useRef(false)   // are we recording the user right now?
   const statusRef = useRef('connecting')
   const micOnRef = useRef(false)
@@ -48,11 +49,14 @@ export function useInterview() {
     const player = new QueuedAudioPlayer()
     player.onAmplitudeChange = setAmplitude
     player.onPlaybackEnd = () => {
-      // AI finished talking. Return to 'idle' — which, when the mic is on,
-      // means "armed and waiting for you to speak".
-      // Drop the VAD back to its normal sensitivity now that nothing is
-      // bleeding out of the speakers.
       vadRef.current?.setAiSpeaking(false)
+      // Commit the full AI response to the transcript now that audio is done,
+      // so it never overlaps with the partialAI sentence display.
+      if (pendingFullTextRef.current) {
+        const text = pendingFullTextRef.current
+        pendingFullTextRef.current = ''
+        setTranscript((t) => [...t, { role: 'assistant', text }])
+      }
       setPartialAI('')
       setStatus('idle')
     }
@@ -110,7 +114,7 @@ export function useInterview() {
 
       switch (msg.type) {
         case 'ai_text':
-          setTranscript((t) => [...t, { role: 'assistant', text: msg.text }])
+          pendingFullTextRef.current = msg.text
           break
         case 'user_text':
           setTranscript((t) => [
@@ -122,11 +126,7 @@ export function useInterview() {
           pendingSentenceTextRef.current = msg.text
           break
         case 'ai_text_final':
-          setTranscript((t) => {
-            const last = t[t.length - 1]
-            if (last && last.role === 'assistant' && last.text === msg.text) return t
-            return [...t, { role: 'assistant', text: msg.text }]
-          })
+          pendingFullTextRef.current = msg.text
           break
         case 'turn_end':
           break
@@ -213,8 +213,8 @@ export function useInterview() {
         onSpeechStart: handleSpeechStart,
         onSpeechEnd: handleSpeechEnd,
         onLevel: setMicLevel,
-        speechThreshold: 0.06,    // base sensitivity (mic quiet, AI not talking)
-        bargeInThreshold: 0.16,   // must be louder to interrupt the AI mid-sentence
+        speechThreshold: 0.10,    // base sensitivity (mic quiet, AI not talking)
+        bargeInThreshold: 0.20,   // must be louder to interrupt the AI mid-sentence
         silenceMs: 1100,
         minSpeechMs: 250,
         startSpeechMs: 180,       // sustain above threshold this long before a turn starts
@@ -223,6 +223,10 @@ export function useInterview() {
       setMicOn(true)
       setError(null)
       setStatus('idle')
+      // Ask backend to send the greeting now that the user has started.
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'start' }))
+      }
     } catch (e) {
       setError('Microphone permission denied or not available.')
       setMicOn(false)
@@ -253,6 +257,7 @@ export function useInterview() {
     setTranscript([])
     setPartialAI('')
     setStatus('idle')
+    // Backend will re-send the greeting in response to reset.
     wsRef.current.send(JSON.stringify({ type: 'reset' }))
   }, [])
 

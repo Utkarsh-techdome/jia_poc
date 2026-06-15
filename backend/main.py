@@ -45,8 +45,8 @@ async def lifespan(app: FastAPI):
         logger.info(f"LLM backend: llamacpp @ {os.getenv('LLAMA_BASE_URL', 'https://assetid-65.tail55f76c.ts.net/v1')}  model: {os.getenv('LLAMA_MODEL', 'LFM2.5-8B-A1B-Q5_K_M.gguf')}")
     else:
         logger.info(f"LLM backend: openrouter  model: {os.getenv('LLM_MODEL', 'meta-llama/llama-3.3-70b-instruct')}")
-    logger.info(f"Whisper: {os.getenv('WHISPER_MODEL')} on {os.getenv('WHISPER_DEVICE')}")
-    logger.info(f"Kokoro voice: {os.getenv('KOKORO_VOICE')}")
+    logger.info(f"Whisper: {stt.WHISPER_MODEL} on {stt.WHISPER_DEVICE} (compute_type={stt.WHISPER_COMPUTE_TYPE}, pool={stt.WHISPER_POOL_SIZE})")
+    logger.info(f"Kokoro TTS: voice={os.getenv('KOKORO_VOICE', 'af_heart')}, pool={tts.TTS_POOL_SIZE}")
     logger.info("=" * 60)
     yield
 
@@ -56,7 +56,11 @@ app = FastAPI(lifespan=lifespan)
 # Allow Vite dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://crawford-protection-specialists-paso.trycloudflare.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -130,12 +134,14 @@ async def interview_socket(ws: WebSocket):
     # Conversation history (just for this session, in memory)
     history: list[dict] = []
 
-    # Send initial greeting from the AI
-    greeting = "Hi! Thanks for joining today. To start, could you tell me a bit about yourself and your background?"
-    history.append({"role": "assistant", "content": greeting})
-    await _safe_send_text(ws, {"type": "ai_text", "text": greeting})
-    await _synthesize_and_send(ws, greeting)
-    await _safe_send_text(ws, {"type": "turn_end"})
+    GREETING = "Hi! Thanks for joining today. To start, could you tell me a bit about yourself and your background?"
+
+    async def send_greeting():
+        history.clear()
+        history.append({"role": "assistant", "content": GREETING})
+        await _safe_send_text(ws, {"type": "ai_text", "text": GREETING})
+        await _synthesize_and_send(ws, GREETING)
+        await _safe_send_text(ws, {"type": "turn_end"})
 
     try:
         while True:
@@ -225,12 +231,8 @@ async def interview_socket(ws: WebSocket):
                     ctrl = json.loads(msg["text"])
                 except json.JSONDecodeError:
                     continue
-                if ctrl.get("type") == "reset":
-                    history.clear()
-                    history.append({"role": "assistant", "content": greeting})
-                    await _safe_send_text(ws, {"type": "ai_text", "text": greeting})
-                    await _synthesize_and_send(ws, greeting)
-                    await _safe_send_text(ws, {"type": "turn_end"})
+                if ctrl.get("type") in ("start", "reset"):
+                    await send_greeting()
 
     except WebSocketDisconnect:
         logger.info("Client disconnected.")

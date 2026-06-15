@@ -7,6 +7,7 @@ import io
 import re
 import logging
 from pathlib import Path
+from queue import Queue
 import numpy as np
 import soundfile as sf
 import httpx
@@ -43,9 +44,13 @@ def _download_if_missing(url: str, dest: Path):
 _download_if_missing(MODEL_URL, MODEL_PATH)
 _download_if_missing(VOICES_URL, VOICES_PATH)
 
-logger.info("Loading Kokoro TTS...")
-_kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH))
-logger.info("Kokoro loaded.")
+TTS_POOL_SIZE = int(os.getenv("TTS_POOL_SIZE", "2"))
+
+logger.info(f"Loading {TTS_POOL_SIZE}x Kokoro TTS...")
+_pool: Queue[Kokoro] = Queue()
+for _ in range(TTS_POOL_SIZE):
+    _pool.put(Kokoro(str(MODEL_PATH), str(VOICES_PATH)))
+logger.info(f"Kokoro pool ready ({TTS_POOL_SIZE} instances).")
 
 
 def _clean_for_tts(text: str) -> str:
@@ -76,25 +81,29 @@ def synthesize(text: str) -> bytes:
     if not text:
         return b""
 
+    kokoro = _pool.get()
     try:
-        samples, sample_rate = _kokoro.create(
-            text, voice=KOKORO_VOICE, speed=1.0, lang="en-us",
-        )
-    except Exception as e:
-        # Known failure: phonemizer line-count mismatch on odd punctuation.
-        # Retry once with a more aggressive cleanup (letters/digits/basic punct).
-        logger.warning(f"TTS failed for {text[:50]!r} ({e}); retrying cleaned.")
-        safe = re.sub(r"[^A-Za-z0-9 .,!?'\-]", " ", text)
-        safe = re.sub(r"\s+", " ", safe).strip()
-        if not safe:
-            return b""
         try:
-            samples, sample_rate = _kokoro.create(
-                safe, voice=KOKORO_VOICE, speed=1.0, lang="en-us",
+            samples, sample_rate = kokoro.create(
+                text, voice=KOKORO_VOICE, speed=1.0, lang="en-us",
             )
-        except Exception:
-            logger.exception(f"TTS gave up on chunk: {text[:50]!r}")
-            return b""
+        except Exception as e:
+            # Known failure: phonemizer line-count mismatch on odd punctuation.
+            # Retry once with a more aggressive cleanup (letters/digits/basic punct).
+            logger.warning(f"TTS failed for {text[:50]!r} ({e}); retrying cleaned.")
+            safe = re.sub(r"[^A-Za-z0-9 .,!?'\-]", " ", text)
+            safe = re.sub(r"\s+", " ", safe).strip()
+            if not safe:
+                return b""
+            try:
+                samples, sample_rate = kokoro.create(
+                    safe, voice=KOKORO_VOICE, speed=1.0, lang="en-us",
+                )
+            except Exception:
+                logger.exception(f"TTS gave up on chunk: {text[:50]!r}")
+                return b""
+    finally:
+        _pool.put(kokoro)
 
     # Convert to 16-bit PCM WAV
     buf = io.BytesIO()

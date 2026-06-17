@@ -74,7 +74,7 @@ def synthesize(text: str) -> bytes:
     Synthesize text to a WAV byte string (mono, 24kHz).
     Returns WAV-formatted bytes ready to send to the browser.
 
-    Never raises: if phonemization fails on a given chunk, returns b"" so a
+    Never raises: if phonemization or encoding fails, returns b"" so a
     single bad sentence can't take down the whole turn.
     """
     text = _clean_for_tts(text)
@@ -82,6 +82,8 @@ def synthesize(text: str) -> bytes:
         return b""
 
     kokoro = _pool.get()
+    samples = None
+    sample_rate = None
     try:
         try:
             samples, sample_rate = kokoro.create(
@@ -90,7 +92,7 @@ def synthesize(text: str) -> bytes:
         except Exception as e:
             # Known failure: phonemizer line-count mismatch on odd punctuation.
             # Retry once with a more aggressive cleanup (letters/digits/basic punct).
-            logger.warning(f"TTS failed for {text[:50]!r} ({e}); retrying cleaned.")
+            logger.warning(f"TTS first attempt failed for {text[:50]!r}: {e}; retrying cleaned.")
             safe = re.sub(r"[^A-Za-z0-9 .,!?'\-]", " ", text)
             safe = re.sub(r"\s+", " ", safe).strip()
             if not safe:
@@ -105,7 +107,18 @@ def synthesize(text: str) -> bytes:
     finally:
         _pool.put(kokoro)
 
+    if samples is None or (hasattr(samples, '__len__') and len(samples) == 0):
+        logger.warning(f"TTS produced empty samples for: {text[:50]!r}")
+        return b""
+
     # Convert to 16-bit PCM WAV
-    buf = io.BytesIO()
-    sf.write(buf, samples, sample_rate, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
+    try:
+        buf = io.BytesIO()
+        sf.write(buf, samples, sample_rate, format="WAV", subtype="PCM_16")
+        wav = buf.getvalue()
+        if not wav:
+            logger.warning(f"sf.write produced empty bytes for: {text[:50]!r}")
+        return wav
+    except Exception:
+        logger.exception(f"WAV encoding failed for: {text[:50]!r}")
+        return b""

@@ -77,7 +77,7 @@ async def _stream_llamacpp(messages: list) -> AsyncIterator[str]:
         messages=messages,
         stream=True,
         temperature=0.7,
-        max_tokens=1500,
+        max_tokens=4096,
     )
     async for chunk in stream:
         token = chunk.choices[0].delta.content

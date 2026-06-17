@@ -45,8 +45,8 @@ async def lifespan(app: FastAPI):
         logger.info(f"LLM backend: llamacpp @ {os.getenv('LLAMA_BASE_URL', 'https://assetid-65.tail55f76c.ts.net/v1')}  model: {os.getenv('LLAMA_MODEL', 'LFM2.5-8B-A1B-Q5_K_M.gguf')}")
     else:
         logger.info(f"LLM backend: openrouter  model: {os.getenv('LLM_MODEL', 'meta-llama/llama-3.3-70b-instruct')}")
-    logger.info(f"Whisper: {stt.WHISPER_MODEL} on {stt.WHISPER_DEVICE} (compute_type={stt.WHISPER_COMPUTE_TYPE}, pool={stt.WHISPER_POOL_SIZE})")
-    logger.info(f"Kokoro TTS: voice={os.getenv('KOKORO_VOICE', 'af_heart')}, pool={tts.TTS_POOL_SIZE}")
+    logger.info(f"Whisper: {os.getenv('WHISPER_MODEL')} on {os.getenv('WHISPER_DEVICE')}")
+    logger.info(f"Kokoro voice: {os.getenv('KOKORO_VOICE')}")
     logger.info("=" * 60)
     yield
 
@@ -56,11 +56,7 @@ app = FastAPI(lifespan=lifespan)
 # Allow Vite dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://crawford-protection-specialists-paso.trycloudflare.com",
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -114,10 +110,10 @@ async def _synthesize_and_send(ws: WebSocket, sentence: str):
     if not sentence.strip():
         return
     t0 = time.perf_counter()
-    # Run TTS in a thread so we don't block the event loop
     wav_bytes = await asyncio.to_thread(tts.synthesize, sentence)
     if not wav_bytes:
-        return  # TTS skipped this chunk (e.g. unspeakable text)
+        logger.warning(f"TTS returned empty for: {sentence[:60]!r}")
+        return
     dt = (time.perf_counter() - t0) * 1000
     logger.info(f"TTS '{sentence[:40]}...' -> {len(wav_bytes)} bytes in {dt:.0f}ms")
 
@@ -131,108 +127,135 @@ async def interview_socket(ws: WebSocket):
     await ws.accept()
     logger.info("Client connected.")
 
-    # Conversation history (just for this session, in memory)
     history: list[dict] = []
+    session_system_prompt = None
+    greeting = "Hi! Thanks for joining today. To start, could you tell me a bit about yourself and your background?"
+    pending_audio = None
 
-    GREETING = "Hi! Thanks for joining today. To start, could you tell me a bit about yourself and your background?"
+    # Peek at the first message.  JIA sends {"type":"start"} immediately before
+    # any audio so we can pick up the system prompt and greeting it provides.
+    # The PoC's own React frontend sends audio straight away, so we time-out
+    # after 2 s and fall back to defaults in that case.
+    try:
+        first_msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+        if first_msg.get("type") != "websocket.disconnect":
+            if "text" in first_msg and first_msg["text"]:
+                try:
+                    ctrl = json.loads(first_msg["text"])
+                    if ctrl.get("type") == "start":
+                        session_system_prompt = ctrl.get("system_prompt") or None
+                        greeting = ctrl.get("greeting") or greeting
+                        logger.info(
+                            f"Session start received: system_prompt={'yes' if session_system_prompt else 'no'}, "
+                            f"greeting={greeting[:60]!r}"
+                        )
+                except json.JSONDecodeError:
+                    pass
+            elif "bytes" in first_msg and first_msg["bytes"]:
+                pending_audio = first_msg["bytes"]
+    except asyncio.TimeoutError:
+        logger.info("No start message within 2 s — using defaults")
 
-    async def send_greeting():
-        history.clear()
-        history.append({"role": "assistant", "content": GREETING})
-        await _safe_send_text(ws, {"type": "ai_text", "text": GREETING})
-        await _synthesize_and_send(ws, GREETING)
+    # Send initial greeting
+    history.append({"role": "assistant", "content": greeting})
+    await _safe_send_text(ws, {"type": "ai_text", "text": greeting})
+    await _synthesize_and_send(ws, greeting)
+    await _safe_send_text(ws, {"type": "turn_end"})
+
+    async def _handle_audio(audio_bytes: bytes):
+        logger.info(f"Received {len(audio_bytes)} bytes of user audio")
+
+        t0 = time.perf_counter()
+        try:
+            user_text = await asyncio.to_thread(stt.transcribe_audio, audio_bytes)
+        except Exception as e:
+            logger.exception("STT failed")
+            await _safe_send_text(ws, {"type": "error", "message": f"STT error: {e}"})
+            return
+        stt_ms = (time.perf_counter() - t0) * 1000
+
+        if not user_text:
+            logger.info("STT returned empty — skipping turn silently")
+            return  # don't flood the client with "I didn't catch that"
+
+        await _safe_send_text(ws, {
+            "type": "user_text",
+            "text": user_text,
+            "stt_ms": round(stt_ms),
+        })
+        history.append({"role": "user", "content": user_text})
+
+        t0 = time.perf_counter()
+        first_token_ms = None
+        buffer = ""
+        full_response = ""
+        tts_tasks: list[asyncio.Task] = []
+
+        try:
+            async for token in llm.stream_completion(
+                build_messages(history[:-1], user_text, system_prompt=session_system_prompt)
+            ):
+                if first_token_ms is None:
+                    first_token_ms = (time.perf_counter() - t0) * 1000
+                    logger.info(f"LLM TTFT: {first_token_ms:.0f}ms")
+
+                buffer += token
+                full_response += token
+
+                sentences, buffer = _split_sentences(buffer)
+                for sent in sentences:
+                    task = asyncio.create_task(_synthesize_and_send(ws, sent))
+                    tts_tasks.append(task)
+
+            if buffer.strip():
+                task = asyncio.create_task(_synthesize_and_send(ws, buffer.strip()))
+                tts_tasks.append(task)
+
+        except Exception as e:
+            logger.exception("LLM failed")
+            await _safe_send_text(ws, {"type": "error", "message": f"LLM error: {e}"})
+            return
+
+        # Wait for all in-flight TTS sends to complete before moving on.
+        if tts_tasks:
+            results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error(f"TTS task raised: {r!r}")
+
+        history.append({"role": "assistant", "content": full_response})
+        logger.info(f"AI: {full_response!r}")
+        await _safe_send_text(ws, {"type": "ai_text_final", "text": full_response})
         await _safe_send_text(ws, {"type": "turn_end"})
+
+    # Process any audio that arrived before the greeting (PoC frontend only)
+    if pending_audio:
+        await _handle_audio(pending_audio)
 
     try:
         while True:
-            # Wait for a message - could be text (control) or bytes (audio)
             msg = await ws.receive()
 
             if msg.get("type") == "websocket.disconnect":
                 break
 
-            # Audio chunk from user
             if "bytes" in msg and msg["bytes"] is not None:
-                audio_bytes = msg["bytes"]
-                logger.info(f"Received {len(audio_bytes)} bytes of user audio")
+                await _handle_audio(msg["bytes"])
 
-                # --- STT ---
-                t0 = time.perf_counter()
-                try:
-                    user_text = await asyncio.to_thread(stt.transcribe_audio, audio_bytes)
-                except Exception as e:
-                    logger.exception("STT failed")
-                    await _safe_send_text(ws, {"type": "error", "message": f"STT error: {e}"})
-                    continue
-                stt_ms = (time.perf_counter() - t0) * 1000
-
-                if not user_text:
-                    await _safe_send_text(ws, {
-                        "type": "error",
-                        "message": "I didn't catch that, could you try again?",
-                    })
-                    continue
-
-                await _safe_send_text(ws, {
-                    "type": "user_text",
-                    "text": user_text,
-                    "stt_ms": round(stt_ms),
-                })
-                history.append({"role": "user", "content": user_text})
-
-                # --- LLM streaming + sentence-level TTS ---
-                t0 = time.perf_counter()
-                first_token_ms = None
-                buffer = ""
-                full_response = ""
-                tts_tasks = []
-
-                try:
-                    async for token in llm.stream_completion(build_messages(history[:-1], user_text)):
-                        if first_token_ms is None:
-                            first_token_ms = (time.perf_counter() - t0) * 1000
-                            logger.info(f"LLM TTFT: {first_token_ms:.0f}ms")
-
-                        buffer += token
-                        full_response += token
-
-                        # Pull out any complete sentences and start TTS on each
-                        sentences, buffer = _split_sentences(buffer)
-                        for sent in sentences:
-                            # Fire TTS but don't await - let it run in background
-                            # so the next LLM tokens can keep arriving
-                            task = asyncio.create_task(_synthesize_and_send(ws, sent))
-                            tts_tasks.append(task)
-
-                    # Anything left in buffer is the last partial sentence
-                    if buffer.strip():
-                        task = asyncio.create_task(_synthesize_and_send(ws, buffer.strip()))
-                        tts_tasks.append(task)
-
-                except Exception as e:
-                    logger.exception("LLM failed")
-                    await _safe_send_text(ws, {"type": "error", "message": f"LLM error: {e}"})
-                    continue
-
-                # Wait for all TTS chunks to finish sending. A chunk task never
-                # raises (errors are swallowed inside), but guard anyway.
-                if tts_tasks:
-                    await asyncio.gather(*tts_tasks, return_exceptions=True)
-
-                history.append({"role": "assistant", "content": full_response})
-                logger.info(f"AI: {full_response!r}")
-
-                await _safe_send_text(ws, {"type": "ai_text_final", "text": full_response})
-                await _safe_send_text(ws, {"type": "turn_end"})
-
-            # Control messages from frontend (e.g. "reset")
             elif "text" in msg and msg["text"] is not None:
                 try:
                     ctrl = json.loads(msg["text"])
                 except json.JSONDecodeError:
                     continue
-                if ctrl.get("type") in ("start", "reset"):
-                    await send_greeting()
+                if ctrl.get("type") == "reset":
+                    history.clear()
+                    history.append({"role": "assistant", "content": greeting})
+                    await _safe_send_text(ws, {"type": "ai_text", "text": greeting})
+                    await _synthesize_and_send(ws, greeting)
+                    await _safe_send_text(ws, {"type": "turn_end"})
+                elif ctrl.get("type") == "start":
+                    # Late-arriving start — update the system prompt for next turn
+                    session_system_prompt = ctrl.get("system_prompt") or session_system_prompt
 
     except WebSocketDisconnect:
         logger.info("Client disconnected.")

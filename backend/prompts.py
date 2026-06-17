@@ -35,9 +35,9 @@ Your interview flow:
 Remember: You are the interviewer. Stay in role. Short, one question at a time, always steering back to the candidate's experience."""
 
 
-def build_messages(history: list, user_text: str) -> list:
+def build_messages(history: list, user_text: str, system_prompt=None) -> list:
     """Build the message list for the LLM call."""
-    messages = [{"role": "system", "content": INTERVIEWER_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_prompt or INTERVIEWER_SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     return messages
